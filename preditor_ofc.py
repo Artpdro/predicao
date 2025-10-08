@@ -50,9 +50,12 @@ class AccidentPredictor:
             uf=("uf", lambda x: x.mode()[0]),
             municipio=("municipio", lambda x: x.mode()[0]),
             tipo_acidente=("tipo_acidente", lambda x: x.mode()[0]),
-            clima=("condicao_metereologica", lambda x: x.mode()[0]),
+            condicao_metereologica=("condicao_metereologica", lambda x: x.mode()[0]), # Manter o nome original
             hora_media=("hora", "mean")
         ).reset_index()
+        # Aplicar _simplificar_clima após a agregação para a coluna 'clima'
+        agg["clima"] = agg["condicao_metereologica"].apply(self._simplificar_clima)
+        agg = agg.drop(columns=["condicao_metereologica"]) # Remover a coluna original após simplificação
 
         return agg.sort_values("data").reset_index(drop=True)
 
@@ -71,18 +74,41 @@ class AccidentPredictor:
         df["dia_ano_sin"] = np.sin(2 * np.pi * df["dia_ano"] / 365.25)
         df["dia_ano_cos"] = np.cos(2 * np.pi * df["dia_ano"] / 365.25)
 
-        for lag in [1, 2, 7, 14]:
-            df[f"lag_{lag}"] = df["acidentes"].shift(lag)
-        for w in [7, 14, 28]:
-            df[f"media_{w}"] = df["acidentes"].shift(1).rolling(w, min_periods=1).mean()
-            df[f"std_{w}"] = df["acidentes"].shift(1).rolling(w, min_periods=1).std()
+        # Lags e médias móveis só fazem sentido se houver a coluna 'acidentes'
+        # Durante a previsão, df_processado terá 'acidentes' = 0, então estas features serão 0
+        if 'acidentes' in df.columns:
+            for lag in [1, 2, 7, 14]:
+                df[f"lag_{lag}"] = df["acidentes"].shift(lag)
+            for w in [7, 14, 28]:
+                df[f"media_{w}"] = df["acidentes"].shift(1).rolling(w, min_periods=1).mean()
+                df[f"std_{w}"] = df["acidentes"].shift(1).rolling(w, min_periods=1).std()
+        else:
+            for lag in [1, 2, 7, 14]:
+                df[f"lag_{lag}"] = 0
+            for w in [7, 14, 28]:
+                df[f"media_{w}"] = 0
+                df[f"std_{w}"] = 0
 
         df.fillna(0, inplace=True)
 
         for col in ["uf", "municipio", "tipo_acidente", "clima"]:
-            enc = LabelEncoder()
-            df[f"{col}_enc"] = enc.fit_transform(df[col])
-            self.encoders[col] = enc
+            if col in df.columns:
+                if col in self.encoders:
+                    enc = self.encoders[col]
+                    df.loc[:, f"{col}_enc"] = df[col].apply(lambda x: enc.transform([x])[0] if x in enc.classes_ else -1)
+                else:
+                    # Isso só deve acontecer durante o treinamento inicial
+                    enc = LabelEncoder()
+                    df.loc[:, f"{col}_enc"] = enc.fit_transform(df[col])
+                    self.encoders[col] = enc
+            else:
+                # Se a coluna não estiver presente no df, mas o encoder existir (modo de previsão),
+                # preencher com um valor padrão (e.g., -1 para 'desconhecido')
+                if col in self.encoders:
+                    df.loc[:, f"{col}_enc"] = -1
+                else:
+                    # Se a coluna não existe e não há encoder, criar com 0 (caso de treinamento com dados incompletos)
+                    df.loc[:, f"{col}_enc"] = 0
 
         features = [
             "ano", "mes", "dia_semana", "dia_ano", "semana", "fim_semana",
@@ -93,7 +119,8 @@ class AccidentPredictor:
             [f"std_{i}" for i in [7, 14, 28]] + \
             [f"{c}_enc" for c in ["uf", "municipio", "tipo_acidente", "clima"]]
 
-        return df[features], df["acidentes"]
+        y = df["acidentes"] if "acidentes" in df.columns else None
+        return df[features], y
 
     def _otimizar_parametros(self, X, y, grid):
         tscv = TimeSeriesSplit(n_splits=5)
@@ -145,6 +172,33 @@ class AccidentPredictor:
         self.treinado = True
 
         print(f"Treinamento concluído | R²: {self.r2_score:.4f} | RMSE: {self.rmse_score:.2f}")
+
+    def prever(self, df_novos_dados):
+        if not self.treinado:
+            raise RuntimeError("Treine o modelo antes de fazer previsões.")
+
+        df_processado = self._processar_dados(df_novos_dados.copy())
+        
+        # Para a previsão, precisamos garantir que as colunas categóricas originais
+        # estejam presentes no df_processado antes de _criar_features ser chamado.
+        # O _processar_dados já retorna as colunas agregadas (uf, municipio, etc.).
+        # No entanto, para a codificação, _criar_features precisa delas.
+        # O problema anterior era que _criar_features tentava acessar df[col] onde col era 'uf' etc.
+        # mas df_processado já tinha essas colunas agregadas.
+        # A solução é garantir que _criar_features possa lidar com a ausência de 'acidentes'
+        # e que os encoders sejam aplicados corretamente.
+
+        X_prever, _ = self._criar_features(df_processado)
+
+        # Garantir que as colunas de previsão correspondam às colunas de treinamento
+        missing_cols = set(self.feature_names) - set(X_prever.columns)
+        for c in missing_cols:
+            X_prever[c] = 0
+        X_prever = X_prever[self.feature_names]
+
+        previsoes = np.clip(np.round(self.modelo.predict(X_prever)), 0, None)
+        df_processado["previsoes_acidentes"] = previsoes
+        return df_processado[["data", "previsoes_acidentes"]]
 
     def salvar_modelo(self, nome="modelo_acidentes.pkl"):
         if not self.treinado:
